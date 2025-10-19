@@ -1,0 +1,70 @@
+name: Create New Post
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'GitHub repository URL'
+        required: true
+        type: string
+      image_url:
+        description: 'Image URL (optional)'
+        required: false
+        type: string
+      tags:
+        description: 'Comma-separated tags (e.g., homelab,docker,go)'
+        required: false
+        type: string
+        default: 'homelab'
+
+jobs:
+  create-post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Download image (if URL provided)
+        if: ${{ inputs.image_url != '' }}
+        run: |
+          mkdir -p /tmp/images
+          curl -L -o /tmp/images/screenshot.png "${{ inputs.image_url }}"
+          echo "IMAGE_PATH=/tmp/images/screenshot.png" >> $GITHUB_ENV
+
+      - name: Generate post
+        working-directory: _companion
+        run: |
+          go mod download
+
+          if [ -n "$IMAGE_PATH" ]; then
+            go run main.go \
+              --repo "${{ inputs.repo_url }}" \
+              --image "$IMAGE_PATH" \
+              --tags "${{ inputs.tags }}"
+          else
+            go run main.go \
+              --repo "${{ inputs.repo_url }}" \
+              --tags "${{ inputs.tags }}"
+          fi
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "Add new post from ${{ inputs.repo_url }}"
+          branch: post/auto-generated-${{ github.run_number }}
+          title: "New Post: ${{ inputs.repo_url }}"
+          body: |
+            🤖 Auto-generated post from companion app
+
+            **Repository:** ${{ inputs.repo_url }}
+            **Tags:** ${{ inputs.tags }}
+
+            Please review and merge to publish.
+          labels: automated-post
