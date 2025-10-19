@@ -1,3 +1,5 @@
 logs/
 megafone
 *.log
+.DS_Store
+.hugo_build.lock
