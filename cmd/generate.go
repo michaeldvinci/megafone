@@ -43,10 +43,10 @@ and uses OpenAI to generate a technical blog post matching your style.`,
 func init() {
 	rootCmd.AddCommand(generateCmd)
 
-	generateCmd.Flags().StringVarP(&topicURL, "topic", "t", "", "GitHub repository URL to write about (required)")
+	generateCmd.Flags().StringVarP(&topicURL, "topic", "t", "", "GitHub repository URL or website URL to write about (required)")
 	generateCmd.Flags().StringVarP(&imagePath, "image", "i", "", "Path to hero image")
 	generateCmd.Flags().StringVarP(&tags, "tags", "T", "", "Comma-separated tags (AI will suggest if not provided)")
-	generateCmd.Flags().StringVarP(&promptFile, "prompt", "p", "prompt.txt", "Path to prompt template file")
+	generateCmd.Flags().StringVarP(&promptFile, "prompt", "p", "", "Path to prompt template file (auto-selected if not provided)")
 	generateCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "Print generated content without writing files")
 	generateCmd.Flags().StringVarP(&model, "model", "m", "gpt-4o-mini", "OpenAI model to use (gpt-4o, gpt-4o-mini, gpt-4-turbo)")
 	generateCmd.Flags().StringVarP(&siteSource, "site-source", "s", "", "Path to local Hugo site repository (if not provided, will show git clone command)")
@@ -83,6 +83,12 @@ func runGenerate(cmd *cobra.Command) error {
 
 	// Determine if this is a GitHub repo or a regular website
 	isGitHub := isGitHubURL(topicURL)
+
+	// Auto-select prompt template if not specified
+	if promptFile == "" {
+		promptFile = selectPromptTemplate(isGitHub, topicURL)
+		logInfo("📋 Auto-selected prompt template: %s", promptFile)
+	}
 
 	var repoData *github.Repository
 	var readmeContent string
@@ -142,7 +148,7 @@ func runGenerate(cmd *cobra.Command) error {
 	} else {
 		// Handle regular website
 		logInfo("🌐 Fetching website content...")
-		websiteContent, title, err := fetchWebsiteContent(topicURL)
+		websiteContent, title, htmlContent, err := fetchWebsiteContent(topicURL)
 		if err != nil {
 			logError("Failed to fetch website: %v", err)
 			return fmt.Errorf("failed to fetch website: %w", err)
@@ -151,7 +157,7 @@ func runGenerate(cmd *cobra.Command) error {
 		contentTitle = title
 		logInfo("📄 Fetched content from: %s", title)
 
-		// Process image if provided
+		// Process image if provided, otherwise try to extract from page
 		if imagePath != "" {
 			logInfo("🖼️  Processing provided image: %s", imagePath)
 			// Use a sanitized version of the title for the image name
@@ -160,6 +166,20 @@ func runGenerate(cmd *cobra.Command) error {
 			if err != nil {
 				logError("Failed to process image: %v", err)
 				return fmt.Errorf("failed to process image: %w", err)
+			}
+		} else {
+			// Try to extract hero image from the webpage
+			logInfo("🔍 Searching for hero image in webpage...")
+			imageURL := extractBestImage(htmlContent, topicURL)
+			if imageURL != "" {
+				logInfo("✨ Found image: %s", imageURL)
+				imgBaseName := sanitizeFilename(title)
+				imageName, err = downloadAndProcessWebImage(imageURL, imgBaseName, basePath)
+				if err != nil {
+					logError("Failed to download image: %v", err)
+				}
+			} else {
+				logInfo("No suitable image found in webpage")
 			}
 		}
 	}
@@ -431,11 +451,51 @@ func isGitHubURL(urlStr string) bool {
 	return strings.Contains(urlStr, "github.com")
 }
 
-func fetchWebsiteContent(urlStr string) (content, title string, err error) {
+func selectPromptTemplate(isGitHub bool, urlStr string) string {
+	// If GitHub, use the project template
+	if isGitHub {
+		return "prompts/github-project.txt"
+	}
+
+	// For websites, detect content type based on URL patterns
+	urlLower := strings.ToLower(urlStr)
+
+	// News sites and articles
+	newsPatterns := []string{
+		"cnn.com", "bbc.com", "reuters.com", "apnews.com",
+		"nytimes.com", "wsj.com", "bloomberg.com", "techcrunch.com",
+		"theverge.com", "arstechnica.com", "wired.com",
+		"/news/", "/article/", "/story/",
+	}
+
+	for _, pattern := range newsPatterns {
+		if strings.Contains(urlLower, pattern) {
+			return "prompts/news-article.txt"
+		}
+	}
+
+	// Technical documentation and tutorials
+	technicalPatterns := []string{
+		"stackoverflow.com", "dev.to", "medium.com",
+		"docs.", "documentation", "/tutorial/", "/guide/",
+		"/blog/", "hashnode.com", "substack.com",
+	}
+
+	for _, pattern := range technicalPatterns {
+		if strings.Contains(urlLower, pattern) {
+			return "prompts/technical-article.txt"
+		}
+	}
+
+	// Default to news article template for general websites
+	return "prompts/news-article.txt"
+}
+
+func fetchWebsiteContent(urlStr string) (content, title, htmlContent string, err error) {
 	// Parse and validate URL
 	parsedURL, err := url.Parse(urlStr)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid URL: %w", err)
+		return "", "", "", fmt.Errorf("invalid URL: %w", err)
 	}
 
 	// Ensure we have a scheme
@@ -446,21 +506,21 @@ func fetchWebsiteContent(urlStr string) (content, title string, err error) {
 	// Fetch the webpage
 	resp, err := http.Get(urlStr)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to fetch URL: %w", err)
+		return "", "", "", fmt.Errorf("failed to fetch URL: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("HTTP error: %s", resp.Status)
+		return "", "", "", fmt.Errorf("HTTP error: %s", resp.Status)
 	}
 
 	// Read the body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to read response: %w", err)
+		return "", "", "", fmt.Errorf("failed to read response: %w", err)
 	}
 
-	htmlContent := string(body)
+	htmlContent = string(body)
 
 	// Extract title from HTML
 	title = extractTitle(htmlContent)
@@ -471,7 +531,7 @@ func fetchWebsiteContent(urlStr string) (content, title string, err error) {
 	// Basic HTML to text conversion (strip tags)
 	content = stripHTMLTags(htmlContent)
 
-	return content, title, nil
+	return content, title, htmlContent, nil
 }
 
 func extractTitle(html string) string {
@@ -493,11 +553,23 @@ func extractTitle(html string) string {
 }
 
 func stripHTMLTags(html string) string {
+	// Try to extract main article content first
+	articleContent := extractArticleContent(html)
+	if articleContent != "" {
+		html = articleContent
+	}
+
 	// Remove script and style elements
-	scriptRegex := regexp.MustCompile(`(?i)<script[^>]*>.*?</script>`)
+	scriptRegex := regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
 	html = scriptRegex.ReplaceAllString(html, "")
-	styleRegex := regexp.MustCompile(`(?i)<style[^>]*>.*?</style>`)
+	styleRegex := regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
 	html = styleRegex.ReplaceAllString(html, "")
+
+	// Remove nav, header, footer, aside elements (separately since Go doesn't support backreferences)
+	html = regexp.MustCompile(`(?is)<nav[^>]*>.*?</nav>`).ReplaceAllString(html, "")
+	html = regexp.MustCompile(`(?is)<header[^>]*>.*?</header>`).ReplaceAllString(html, "")
+	html = regexp.MustCompile(`(?is)<footer[^>]*>.*?</footer>`).ReplaceAllString(html, "")
+	html = regexp.MustCompile(`(?is)<aside[^>]*>.*?</aside>`).ReplaceAllString(html, "")
 
 	// Remove HTML tags
 	tagRegex := regexp.MustCompile(`<[^>]+>`)
@@ -507,7 +579,36 @@ func stripHTMLTags(html string) string {
 	spaceRegex := regexp.MustCompile(`\s+`)
 	text = spaceRegex.ReplaceAllString(text, " ")
 
-	return strings.TrimSpace(text)
+	text = strings.TrimSpace(text)
+
+	// Truncate if still too large (max ~50k characters = ~12.5k tokens roughly)
+	maxChars := 50000
+	if len(text) > maxChars {
+		text = text[:maxChars] + "... [content truncated]"
+	}
+
+	return text
+}
+
+func extractArticleContent(html string) string {
+	// Try common article content selectors
+	patterns := []string{
+		`(?is)<article[^>]*>(.*?)</article>`,
+		`(?is)<div[^>]*class="[^"]*article-body[^"]*"[^>]*>(.*?)</div>`,
+		`(?is)<div[^>]*class="[^"]*post-content[^"]*"[^>]*>(.*?)</div>`,
+		`(?is)<div[^>]*class="[^"]*entry-content[^"]*"[^>]*>(.*?)</div>`,
+		`(?is)<main[^>]*>(.*?)</main>`,
+	}
+
+	for _, pattern := range patterns {
+		regex := regexp.MustCompile(pattern)
+		matches := regex.FindStringSubmatch(html)
+		if len(matches) > 1 && len(matches[1]) > 500 {
+			return matches[1]
+		}
+	}
+
+	return ""
 }
 
 func sanitizeFilename(s string) string {
@@ -546,6 +647,185 @@ func processImageWithName(srcPath, baseName, basePath string) (string, error) {
 	}
 
 	return imageName, nil
+}
+
+func extractBestImage(html, baseURL string) string {
+	// Try Open Graph image first (most reliable for hero images)
+	ogImageRegex := regexp.MustCompile(`<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']`)
+	matches := ogImageRegex.FindStringSubmatch(html)
+	if len(matches) > 1 {
+		return makeAbsoluteURL(matches[1], baseURL)
+	}
+
+	// Try Twitter card image
+	twitterImageRegex := regexp.MustCompile(`<meta[^>]*name=["']twitter:image["'][^>]*content=["']([^"']+)["']`)
+	matches = twitterImageRegex.FindStringSubmatch(html)
+	if len(matches) > 1 {
+		return makeAbsoluteURL(matches[1], baseURL)
+	}
+
+	// Try to find large images in the article content
+	// Look for images with common hero/featured image patterns
+	heroPatterns := []string{
+		`<img[^>]*class=["'][^"']*hero[^"']*["'][^>]*src=["']([^"']+)["']`,
+		`<img[^>]*class=["'][^"']*featured[^"']*["'][^>]*src=["']([^"']+)["']`,
+		`<img[^>]*class=["'][^"']*main[^"']*["'][^>]*src=["']([^"']+)["']`,
+		`<img[^>]*src=["']([^"']+)["'][^>]*class=["'][^"']*hero[^"']*["']`,
+		`<img[^>]*src=["']([^"']+)["'][^>]*class=["'][^"']*featured[^"']*["']`,
+	}
+
+	for _, pattern := range heroPatterns {
+		regex := regexp.MustCompile(pattern)
+		matches = regex.FindStringSubmatch(html)
+		if len(matches) > 1 {
+			return makeAbsoluteURL(matches[1], baseURL)
+		}
+	}
+
+	// Fallback: Find first img tag in article content
+	articleImgRegex := regexp.MustCompile(`<article[^>]*>.*?<img[^>]*src=["']([^"']+)["']`)
+	matches = articleImgRegex.FindStringSubmatch(html)
+	if len(matches) > 1 {
+		imgURL := matches[1]
+		// Filter out tracking pixels, icons, etc.
+		if !isValidImageURL(imgURL) {
+			return ""
+		}
+		return makeAbsoluteURL(imgURL, baseURL)
+	}
+
+	return ""
+}
+
+func makeAbsoluteURL(imageURL, baseURL string) string {
+	// If already absolute, return as-is
+	if strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://") {
+		return imageURL
+	}
+
+	// Parse base URL
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return imageURL
+	}
+
+	// If image URL starts with //, add scheme
+	if strings.HasPrefix(imageURL, "//") {
+		return base.Scheme + ":" + imageURL
+	}
+
+	// If image URL is relative, make it absolute
+	if strings.HasPrefix(imageURL, "/") {
+		return fmt.Sprintf("%s://%s%s", base.Scheme, base.Host, imageURL)
+	}
+
+	// Relative to current path
+	return fmt.Sprintf("%s://%s%s/%s", base.Scheme, base.Host, filepath.Dir(base.Path), imageURL)
+}
+
+func isValidImageURL(imageURL string) bool {
+	// Filter out common non-hero images
+	lowerURL := strings.ToLower(imageURL)
+
+	// Reject tracking pixels and tiny images
+	if strings.Contains(lowerURL, "1x1") || strings.Contains(lowerURL, "pixel") {
+		return false
+	}
+
+	// Reject icons and logos (usually small)
+	if strings.Contains(lowerURL, "icon") || strings.Contains(lowerURL, "logo") {
+		return false
+	}
+
+	// Reject social media share buttons
+	if strings.Contains(lowerURL, "share") || strings.Contains(lowerURL, "social") {
+		return false
+	}
+
+	// Must be a common image format
+	validExts := []string{".jpg", ".jpeg", ".png", ".webp", ".gif"}
+	hasValidExt := false
+	for _, ext := range validExts {
+		if strings.HasSuffix(lowerURL, ext) {
+			hasValidExt = true
+			break
+		}
+	}
+
+	return hasValidExt
+}
+
+func downloadAndProcessWebImage(imageURL, baseName, basePath string) (string, error) {
+	// Download the image
+	resp, err := http.Get(imageURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to download image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP error downloading image: %s", resp.Status)
+	}
+
+	// Read image data
+	imageData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read image: %w", err)
+	}
+
+	// Determine file extension from URL or content-type
+	ext := extractImageExtension(imageURL)
+	if ext == "" {
+		contentType := resp.Header.Get("Content-Type")
+		switch contentType {
+		case "image/jpeg", "image/jpg":
+			ext = ".jpg"
+		case "image/png":
+			ext = ".png"
+		case "image/webp":
+			ext = ".webp"
+		case "image/gif":
+			ext = ".gif"
+		default:
+			ext = ".jpg" // default
+		}
+	}
+
+	imageName := fmt.Sprintf("%s%s", baseName, ext)
+	destPath := filepath.Join(basePath, "assets", "images", "site", imageName)
+
+	// Ensure destination directory exists
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return "", err
+	}
+
+	// Write image file
+	if err := os.WriteFile(destPath, imageData, 0644); err != nil {
+		return "", err
+	}
+
+	return imageName, nil
+}
+
+func extractImageExtension(imageURL string) string {
+	// Parse URL to get path without query params
+	parsedURL, err := url.Parse(imageURL)
+	if err != nil {
+		return ""
+	}
+
+	// Get extension from path (before query params)
+	ext := strings.ToLower(filepath.Ext(parsedURL.Path))
+
+	// Validate it's an image extension
+	validExts := []string{".jpg", ".jpeg", ".png", ".webp", ".gif"}
+	for _, validExt := range validExts {
+		if ext == validExt {
+			return ext
+		}
+	}
+
+	return ""
 }
 
 func generateFromWebsite(ctx context.Context, apiKey, promptTemplate, urlStr, title, content, userTags, heroImage, model string) (postContent, filename string, err error) {
