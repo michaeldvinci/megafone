@@ -1,10 +1,32 @@
 # Megafone Prompt Templates
 
-This directory contains prompt templates for different content types. Megafone automatically selects the appropriate template based on the URL you provide.
+This directory contains prompt templates for different content types. Megafone automatically selects the appropriate template based on the input you provide (URL or research topic).
 
 ## Available Templates
 
-### 1. `github-project.txt`
+### 1. `research-topic.txt`
+**Used for:** Research topics and general inquiries
+
+**Auto-selected when:**
+- Input is not a URL (doesn't contain http://, https://, or domain extensions)
+- You provide a topic string instead of a URL
+
+**Style:** Comprehensive research-based post with fundamentals, deep-dive sections, and practical examples. Targets 4-5 minute read time (800-1200 words).
+
+**How it works:**
+1. First API call: Researches the topic and gathers comprehensive information
+2. Second API call: Synthesizes research into a well-structured blog post
+
+**Example usage:**
+```bash
+./megafone generate -t "kubernetes security best practices" -s ~/hugo
+./megafone generate -t "how LLMs work" -s ~/hugo
+./megafone generate -t "docker vs podman comparison" -s ~/hugo
+```
+
+---
+
+### 2. `github-project.txt`
 **Used for:** GitHub repositories and open-source projects
 
 **Auto-selected when:**
@@ -19,7 +41,7 @@ This directory contains prompt templates for different content types. Megafone a
 
 ---
 
-### 2. `news-article.txt`
+### 3. `news-article.txt`
 **Used for:** News articles, current events, industry coverage
 
 **Auto-selected when URL contains:**
@@ -36,7 +58,7 @@ This directory contains prompt templates for different content types. Megafone a
 
 ---
 
-### 3. `technical-article.txt`
+### 4. `technical-article.txt`
 **Used for:** Technical tutorials, documentation, deep-dives, how-tos
 
 **Auto-selected when URL contains:**
@@ -76,10 +98,11 @@ Or use a completely custom template:
 ## Default Behavior
 
 If no template is specified:
-1. **GitHub URLs** → `github-project.txt`
-2. **News sites** → `news-article.txt`
-3. **Technical sites** → `technical-article.txt`
-4. **Everything else** → `news-article.txt` (default fallback)
+1. **Research topics** (non-URL strings) → `research-topic.txt`
+2. **GitHub URLs** → `github-project.txt`
+3. **News sites** → `news-article.txt`
+4. **Technical sites** → `technical-article.txt`
+5. **Other URLs** → `news-article.txt` (default fallback)
 
 ## Creating Custom Templates
 

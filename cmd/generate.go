@@ -30,9 +30,20 @@ var (
 
 var generateCmd = &cobra.Command{
 	Use:   "generate",
-	Short: "Generate a new blog post from a GitHub repository",
-	Long: `Fetches repository metadata from GitHub, analyzes the README,
-and uses OpenAI to generate a technical blog post matching your style.`,
+	Short: "Generate a new blog post from a URL or research topic",
+	Long: `Fetches content from a GitHub repository, website URL, or researches a topic
+and uses OpenAI to generate a blog post matching your style.
+
+Examples:
+  # From GitHub repo
+  megafone generate -t https://github.com/user/repo -s ~/hugo
+
+  # From news article
+  megafone generate -t https://www.cnn.com/article -s ~/hugo
+
+  # Research a topic
+  megafone generate -t "kubernetes security best practices" -s ~/hugo
+  megafone generate -t "how LLMs work" -s ~/hugo`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := runGenerate(cmd); err != nil {
 			log.Fatalf("Error: %v", err)
@@ -43,12 +54,12 @@ and uses OpenAI to generate a technical blog post matching your style.`,
 func init() {
 	rootCmd.AddCommand(generateCmd)
 
-	generateCmd.Flags().StringVarP(&topicURL, "topic", "t", "", "GitHub repository URL or website URL to write about (required)")
+	generateCmd.Flags().StringVarP(&topicURL, "topic", "t", "", "GitHub URL, website URL, or research topic string (required)")
 	generateCmd.Flags().StringVarP(&imagePath, "image", "i", "", "Path to hero image")
 	generateCmd.Flags().StringVarP(&tags, "tags", "T", "", "Comma-separated tags (AI will suggest if not provided)")
 	generateCmd.Flags().StringVarP(&promptFile, "prompt", "p", "", "Path to prompt template file (auto-selected if not provided)")
 	generateCmd.Flags().BoolVarP(&dryRun, "dry-run", "d", false, "Print generated content without writing files")
-	generateCmd.Flags().StringVarP(&model, "model", "m", "gpt-4o-mini", "OpenAI model to use (gpt-4o, gpt-4o-mini, gpt-4-turbo)")
+	generateCmd.Flags().StringVarP(&model, "model", "m", "gpt-4o", "OpenAI model to use (gpt-4o, gpt-4o-mini, gpt-4-turbo, or gpt-5)")
 	generateCmd.Flags().StringVarP(&siteSource, "site-source", "s", "", "Path to local Hugo site repository (if not provided, will show git clone command)")
 
 	generateCmd.MarkFlagRequired("topic")
@@ -81,12 +92,12 @@ func runGenerate(cmd *cobra.Command) error {
 		return fmt.Errorf("OpenAI API key required (use --openai-key or OPENAI_API_KEY env var)")
 	}
 
-	// Determine if this is a GitHub repo or a regular website
-	isGitHub := isGitHubURL(topicURL)
+	// Determine content type: GitHub URL, website URL, or research topic
+	contentType := detectContentType(topicURL)
 
 	// Auto-select prompt template if not specified
 	if promptFile == "" {
-		promptFile = selectPromptTemplate(isGitHub, topicURL)
+		promptFile = selectPromptTemplate(contentType, topicURL)
 		logInfo("📋 Auto-selected prompt template: %s", promptFile)
 	}
 
@@ -95,7 +106,7 @@ func runGenerate(cmd *cobra.Command) error {
 	var contentTitle string
 	var imageName string
 
-	if isGitHub {
+	if contentType == "github" {
 		// Parse GitHub repo URL
 		owner, repo, err := parseGitHubURL(topicURL)
 		if err != nil {
@@ -145,7 +156,7 @@ func runGenerate(cmd *cobra.Command) error {
 				}
 			}
 		}
-	} else {
+	} else if contentType == "website" {
 		// Handle regular website
 		logInfo("🌐 Fetching website content...")
 		websiteContent, title, htmlContent, err := fetchWebsiteContent(topicURL)
@@ -182,6 +193,29 @@ func runGenerate(cmd *cobra.Command) error {
 				logInfo("No suitable image found in webpage")
 			}
 		}
+	} else {
+		// Handle research topic
+		logInfo("🔬 Researching topic: %s", topicURL)
+		researchContent, title, err := researchTopic(ctx, apiKey, topicURL, model)
+		if err != nil {
+			logError("Failed to research topic: %v", err)
+			return fmt.Errorf("failed to research topic: %w", err)
+		}
+		readmeContent = researchContent
+		contentTitle = title
+		logInfo("📚 Research completed: %s", title)
+
+		// Process image if provided (will generate one later if not)
+		if imagePath != "" {
+			logInfo("🖼️  Processing provided image: %s", imagePath)
+			imgBaseName := sanitizeFilename(title)
+			imageName, err = processImageWithName(imagePath, imgBaseName, basePath)
+			if err != nil {
+				logError("Failed to process image: %v", err)
+				return fmt.Errorf("failed to process image: %w", err)
+			}
+		}
+		// Note: For research topics, we'll generate an image after the post is created
 	}
 
 	// Load prompt template
@@ -195,10 +229,13 @@ func runGenerate(cmd *cobra.Command) error {
 	// Generate content with OpenAI (now with image info)
 	logInfo("🤖 Generating blog post with OpenAI (%s)...", model)
 	var content, filename string
-	if isGitHub {
+	if contentType == "github" {
 		content, filename, err = generateWithOpenAI(ctx, apiKey, string(promptTemplate), repoData, readmeContent, tags, imageName, model)
-	} else {
+	} else if contentType == "website" {
 		content, filename, err = generateFromWebsite(ctx, apiKey, string(promptTemplate), topicURL, contentTitle, readmeContent, tags, imageName, model)
+	} else {
+		// Research topic
+		content, filename, err = generateFromResearch(ctx, apiKey, string(promptTemplate), topicURL, contentTitle, readmeContent, tags, imageName, model)
 	}
 	if err != nil {
 		logError("OpenAI generation failed: %v", err)
@@ -206,6 +243,37 @@ func runGenerate(cmd *cobra.Command) error {
 	}
 
 	logInfo("Generated filename: %s", filename)
+
+	// Validate we have content and filename before proceeding
+	if content == "" {
+		logError("Generated content is empty! Aborting.")
+		return fmt.Errorf("content generation returned empty result")
+	}
+	if filename == "" {
+		logError("Generated filename is empty! Using fallback.")
+		filename = sanitizeFilename(contentTitle)
+		if filename == "" {
+			filename = "untitled-post"
+		}
+	}
+
+	// Generate hero image if we don't have one yet
+	if imageName == "" && !dryRun {
+		logInfo("🎨 No image found, generating hero image with DALL-E...")
+		generatedImageName, err := generateHeroImage(ctx, apiKey, content, filename, basePath)
+		if err != nil {
+			logError("Failed to generate image: %v", err)
+			logInfo("Continuing without hero image...")
+		} else {
+			imageName = generatedImageName
+			logSuccess("✨ Generated hero image: %s", imageName)
+
+			// Update the content to include the generated image
+			if contentType == "research" || contentType == "website" {
+				content = updateContentWithImage(content, imageName)
+			}
+		}
+	}
 
 	if dryRun {
 		logInfo("Dry run mode - not writing files")
@@ -447,18 +515,41 @@ func resolveSitePath() (string, error) {
 	return "", fmt.Errorf("Hugo site source path required (use --site-source)")
 }
 
-func isGitHubURL(urlStr string) bool {
-	return strings.Contains(urlStr, "github.com")
+func detectContentType(input string) string {
+	// Check if it's a GitHub URL
+	if strings.Contains(input, "github.com") {
+		return "github"
+	}
+
+	// Check if it's any URL (has http/https or common TLDs)
+	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+		return "website"
+	}
+
+	// Check for domain-like patterns (contains .com, .org, etc.)
+	if strings.Contains(input, ".com") || strings.Contains(input, ".org") ||
+		strings.Contains(input, ".net") || strings.Contains(input, ".io") ||
+		strings.Contains(input, ".dev") || strings.Contains(input, ".co") {
+		return "website"
+	}
+
+	// Otherwise, treat as a research topic
+	return "research"
 }
 
-func selectPromptTemplate(isGitHub bool, urlStr string) string {
+func selectPromptTemplate(contentType string, input string) string {
 	// If GitHub, use the project template
-	if isGitHub {
+	if contentType == "github" {
 		return "prompts/github-project.txt"
 	}
 
+	// If research topic, use research template
+	if contentType == "research" {
+		return "prompts/research-topic.txt"
+	}
+
 	// For websites, detect content type based on URL patterns
-	urlLower := strings.ToLower(urlStr)
+	urlLower := strings.ToLower(input)
 
 	// News sites and articles
 	newsPatterns := []string{
@@ -904,4 +995,276 @@ Generate a complete Hugo markdown post following the style guide above.
 	}
 
 	return postContent, filename, nil
+}
+
+func researchTopic(ctx context.Context, apiKey, topic, model string) (researchContent, title string, err error) {
+	client := openai.NewClient(apiKey)
+
+	// Use OpenAI to research the topic and gather comprehensive information
+	researchPrompt := fmt.Sprintf(`Research the following topic and provide comprehensive information that would be useful for writing a detailed blog post:
+
+Topic: %s
+
+Please provide:
+1. Key concepts and definitions
+2. Historical context or background
+3. How it works (technical details if applicable)
+4. Different approaches or perspectives
+5. Practical applications and use cases
+6. Common challenges or pitfalls
+7. Best practices
+8. Current trends or future directions
+9. Real-world examples
+
+Organize the information clearly and comprehensively. This will be used as research material for writing a blog post.`, topic)
+
+	// Build request with model-specific parameters
+	request := openai.ChatCompletionRequest{
+		Model: model,
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: "You are a knowledgeable research assistant who provides comprehensive, accurate information on technical topics. Provide detailed, well-organized research material.",
+			},
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: researchPrompt,
+			},
+		},
+		Temperature: 0.7,
+		MaxTokens:   4000,
+	}
+
+	resp, err := client.CreateChatCompletion(ctx, request)
+
+	if err != nil {
+		return "", "", fmt.Errorf("research API error: %w", err)
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", "", fmt.Errorf("no research results from OpenAI")
+	}
+
+	researchContent = resp.Choices[0].Message.Content
+	title = topic
+
+	return researchContent, title, nil
+}
+
+func generateFromResearch(ctx context.Context, apiKey, promptTemplate, topic, title, researchContent, userTags, heroImage, model string) (postContent, filename string, err error) {
+	client := openai.NewClient(apiKey)
+
+	// Truncate research content if too large (keep first 12000 chars ~ 3000 tokens)
+	maxResearchChars := 12000
+	if len(researchContent) > maxResearchChars {
+		logInfo("Research content is %d chars, truncating to %d chars", len(researchContent), maxResearchChars)
+		researchContent = researchContent[:maxResearchChars] + "\n\n[Research content truncated for length]"
+	}
+
+	// Build context for the AI
+	researchContext := fmt.Sprintf(`
+Research Topic: %s
+
+Research Material:
+%s
+`, topic, researchContent)
+
+	// Get current date for the post
+	currentDate := time.Now().Format("2006-01-02")
+
+	heroImageInfo := ""
+	if heroImage != "" {
+		heroImageInfo = fmt.Sprintf("\nHero image available: %s (use path: /images/site/%s)", heroImage, heroImage)
+	}
+
+	userPrompt := fmt.Sprintf(`%s
+
+Please generate a comprehensive blog post about this research topic:
+
+%s
+%s
+
+User-provided tags: %s (suggest appropriate tags if none provided)
+
+IMPORTANT: Your response must be ONLY valid markdown. Do not include any explanatory text before or after the markdown.
+IMPORTANT: Use date: %s in the front matter.
+IMPORTANT: Target 4-5 minute read time (approximately 800-1200 words).
+%s
+
+Generate a complete Hugo markdown post following the style guide above.
+`, promptTemplate, researchContext, heroImageInfo, userTags, currentDate,
+		func() string {
+			if heroImage != "" {
+				return fmt.Sprintf("IMPORTANT: Include 'hero: /images/site/%s' in the front matter.", heroImage)
+			}
+			return ""
+		}())
+
+	// Build request
+	request := openai.ChatCompletionRequest{
+		Model: model,
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: "You are a technical blog writer who creates comprehensive, well-researched posts. Follow the style guide precisely. Output ONLY the markdown content, no explanations.",
+			},
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: userPrompt,
+			},
+		},
+		Temperature: 0.7,
+		MaxTokens:   3000,
+	}
+
+	resp, err := client.CreateChatCompletion(ctx, request)
+
+	if err != nil {
+		return "", "", fmt.Errorf("OpenAI API error: %w\n\nTroubleshooting:\n- Check your API key is valid\n- Verify your OpenAI account has credits: https://platform.openai.com/usage\n- Try a different model with --model gpt-4o-mini\n- Check rate limits: https://platform.openai.com/account/limits", err)
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", "", fmt.Errorf("no response from OpenAI")
+	}
+
+	postContent = resp.Choices[0].Message.Content
+
+	// Debug: Log response details
+	logInfo("Response finish reason: %s", resp.Choices[0].FinishReason)
+	logInfo("Content length: %d characters", len(postContent))
+
+	// Check if content is empty
+	if postContent == "" {
+		logError("GPT-5 returned empty content!")
+		logError("Finish reason: %s", resp.Choices[0].FinishReason)
+
+		// Check if there are refusals
+		if resp.Choices[0].Message.Refusal != "" {
+			logError("Refusal message: %s", resp.Choices[0].Message.Refusal)
+		}
+
+		return "", "", fmt.Errorf("GPT-5 returned empty content (finish reason: %s)", resp.Choices[0].FinishReason)
+	}
+
+	// Generate filename from content
+	filename, err = generateFilename(ctx, client, postContent, model)
+	if err != nil {
+		// Fallback to sanitized topic if filename generation fails
+		logError("Failed to generate filename, using topic: %v", err)
+		filename = sanitizeFilename(topic)
+	}
+
+	return postContent, filename, nil
+}
+
+func generateHeroImage(ctx context.Context, apiKey, postContent, filename, basePath string) (string, error) {
+	client := openai.NewClient(apiKey)
+
+	// Extract the title and key themes from the post to create a good prompt
+	imagePrompt := createImagePrompt(postContent)
+
+	logInfo("🖼️  Image prompt: %s", imagePrompt)
+
+	// Generate image with DALL-E (landscape format)
+	resp, err := client.CreateImage(ctx, openai.ImageRequest{
+		Prompt:         imagePrompt,
+		N:              1,
+		Size:           openai.CreateImageSize1792x1024, // Landscape format
+		ResponseFormat: openai.CreateImageResponseFormatURL,
+		Model:          openai.CreateImageModelDallE3,
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("DALL-E API error: %w", err)
+	}
+
+	if len(resp.Data) == 0 {
+		return "", fmt.Errorf("no image generated")
+	}
+
+	imageURL := resp.Data[0].URL
+
+	// Download the generated image
+	imgResp, err := http.Get(imageURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to download generated image: %w", err)
+	}
+	defer imgResp.Body.Close()
+
+	if imgResp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP error downloading generated image: %s", imgResp.Status)
+	}
+
+	// Read image data
+	imageData, err := io.ReadAll(imgResp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read generated image: %w", err)
+	}
+
+	// Save with .png extension (DALL-E returns PNG)
+	imageName := fmt.Sprintf("%s.png", filename)
+	destPath := filepath.Join(basePath, "assets", "images", "site", imageName)
+
+	// Ensure destination directory exists
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return "", err
+	}
+
+	// Write image file
+	if err := os.WriteFile(destPath, imageData, 0644); err != nil {
+		return "", err
+	}
+
+	return imageName, nil
+}
+
+func createImagePrompt(postContent string) string {
+	// Extract title from front matter
+	titleRegex := regexp.MustCompile(`title:\s*["']([^"']+)["']`)
+	matches := titleRegex.FindStringSubmatch(postContent)
+	title := ""
+	if len(matches) > 1 {
+		title = matches[1]
+	}
+
+	// Extract description if available
+	descRegex := regexp.MustCompile(`description:\s*["']([^"']+)["']`)
+	matches = descRegex.FindStringSubmatch(postContent)
+	description := ""
+	if len(matches) > 1 {
+		description = matches[1]
+	}
+
+	// Create a clean, descriptive prompt for DALL-E
+	prompt := "Create a modern, minimalist hero image for a technical blog post"
+
+	if title != "" {
+		// Remove common prefixes and clean up the title
+		cleanTitle := strings.TrimPrefix(title, "Understanding ")
+		cleanTitle = strings.TrimPrefix(cleanTitle, "How to ")
+		cleanTitle = strings.TrimPrefix(cleanTitle, "A Guide to ")
+		prompt += " about: " + cleanTitle
+	}
+
+	if description != "" {
+		prompt += ". " + description
+	}
+
+	// Add style guidance for landscape format - emphasize NO TEXT and full bleed design
+	prompt += ". Create a full-bleed design that fills the entire rectangular canvas edge to edge. Use flowing gradients, abstract waves, geometric patterns, or technical mesh backgrounds that cover the whole image. Modern tech aesthetic with rich colors suitable for a developer blog. Wide landscape format (16:9 aspect ratio). IMPORTANT: Absolutely no text, no words, no letters, no numbers, no symbols, no typography of any kind in the image. No floating shapes or objects - the design should fill the entire frame. Pure abstract visual design only."
+
+	return prompt
+}
+
+func updateContentWithImage(content, imageName string) string {
+	// Check if hero field already exists in front matter
+	heroRegex := regexp.MustCompile(`(?m)^hero:\s*.*$`)
+	if heroRegex.MatchString(content) {
+		// Update existing hero field
+		return heroRegex.ReplaceAllString(content, fmt.Sprintf("hero: /images/site/%s", imageName))
+	}
+
+	// Add hero field to front matter (after date line)
+	dateRegex := regexp.MustCompile(`(?m)(^date:\s*.*$)`)
+	return dateRegex.ReplaceAllString(content, fmt.Sprintf("$1\nhero: /images/site/%s", imageName))
 }

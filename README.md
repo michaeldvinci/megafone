@@ -1,16 +1,18 @@
 # megafone 📣
 
-AI-powered content generation and distribution tool for technical blogs. Generate posts from GitHub repositories and broadcast them across multiple platforms.
+AI-powered content generation tool for technical blogs. Generate comprehensive blog posts from GitHub repositories, web articles, or research topics.
 
 ## Features
 
 - 🤖 **AI-Powered Content**: Uses OpenAI GPT-4 to write complete blog posts
+- 🔬 **Research Mode**: Provide a topic string and get a comprehensive 4-5 minute read
 - 📊 **GitHub Integration**: Fetches repo metadata and README automatically
-- 🎨 **Style Matching**: Analyzes existing posts to match your writing voice
-- 🖼️ **Auto Image Detection**: Finds and downloads hero images from README
-- 🏷️ **Smart Tagging**: AI suggests relevant tags based on repo content
-- 📝 **Customizable Prompts**: Edit `prompt.txt` to adjust style and structure
-- 📡 **Multi-Platform Ready**: Foundation for future social media distribution
+- 🌐 **Website Scraping**: Extract content and images from any web article
+- 🎨 **Style Matching**: Multiple prompt templates for different content types
+- 🖼️ **Auto Image Detection**: Finds and downloads hero images from websites and repos
+- 🏷️ **Smart Tagging**: AI suggests relevant tags based on content
+- 📝 **Customizable Prompts**: Multiple templates that auto-select based on content type
+- 🎯 **Smart Content Type Detection**: Automatically picks the right template
 
 ## Prerequisites
 
@@ -33,20 +35,30 @@ go build -o megafone
 # Set your OpenAI API key
 export OPENAI_API_KEY="sk-..."
 
-# Generate a post
+# Generate from GitHub repo
 ./megafone generate \
   --topic https://github.com/user/repo \
   --site-source ~/code/hugo
 
+# Generate from web article (auto-extracts content and image)
+./megafone generate \
+  --topic https://www.cnn.com/2025/10/19/article \
+  --site-source ~/code/hugo
+
+# Research and write about a topic (4-5 min read)
+./megafone generate \
+  --topic "kubernetes security best practices" \
+  --site-source ~/code/hugo
+
 # With custom tags
 ./megafone generate \
-  --topic https://github.com/user/repo \
+  --topic "how LLMs work" \
   --site-source ~/code/hugo \
-  --tags "homelab,go,docker"
+  --tags "ai,machine-learning,deep-dive"
 
 # With manual image
 ./megafone generate \
-  --topic https://github.com/user/repo \
+  --topic https://dev.to/article \
   --site-source ~/code/hugo \
   --image ~/Desktop/screenshot.png
 ```
